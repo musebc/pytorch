@@ -1,7 +1,7 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
 import functools
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import torch
 import torch.utils._pytree as pytree
@@ -9,6 +9,7 @@ from torch._inductor.kernel.mm_common import mm_args
 
 from . import ir
 from .codegen.cpp_gemm_template import CppPackedGemmTemplate
+from .codegen.cpp_group_gemm_template import CppGroupGEMMTemplate
 from .codegen.cpp_utils import create_epilogue_with_attr
 from .ir import TensorBox
 from .lowering import (
@@ -27,6 +28,82 @@ from .select_algorithm import (
 )
 from .utils import use_aten_gemm_kernels, use_cpp_packed_gemm_template, use_max_autotune
 from .virtualized import ops, V
+
+
+def linear_silu_linear_mul(
+    x: TensorBox,
+    w: List[TensorBox],
+    b: List[TensorBox],
+    attr,
+    scalars,
+    algorithm,
+    layout=None,
+):
+    x_size = x.get_size()
+    if len(x_size) > 2:
+        # GEMM template needs 2D input, normalize input shape here
+        x = view(x, [-1, x_size[-1]])
+
+    assert use_max_autotune()
+    b = [bias if bias is None else ir.ExternKernel.realize_input(bias) for bias in b]
+
+    choices: List[ChoiceCaller] = []
+    transposed_w0 = permute(w[0], [1, 0])
+    *_, layout, x, transposed_w0 = mm_args(x, transposed_w0, layout=layout)
+
+    assert use_cpp_packed_gemm_template(layout, x, transposed_w0)
+    kwargs = dict(
+        has_bias=[bias is not None for bias in b],
+        trans_w=True,
+    )
+
+    input_nodes = [x, w[0], w[1]]
+    input_nodes.extend([bias for bias in b if bias is not None])
+
+    def epilogue_creator(buf, buf1, inp, inp1):
+        input_loader = buf.make_loader()
+        input_loader1 = buf1.make_loader()
+        if inp:
+            inp_loader = inp.make_loader()
+        if inp1:
+            inp_loader1 = inp1.make_loader()
+        dtype = buf.get_dtype()
+
+        def inner_fn(index):
+            input = input_loader(index)
+            input1 = input_loader1(index)
+            if inp:
+                input = input + inp_loader(index)
+            if inp1:
+                input1 = input1 + inp_loader1(index)
+            input = ops.mul(ops.sigmoid(input), input)
+            return ops.mul(input, input1)
+
+        return ir.Pointwise(
+            device=buf.get_device(),
+            dtype=dtype,
+            inner_fn=inner_fn,
+            ranges=buf.get_size(),
+        )
+
+    CppGroupGEMMTemplate.add_choices(
+        choices,
+        layout,
+        input_nodes,
+        epilogue_creator=epilogue_creator,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+    assert len(choices) != 0
+    result = autotune_select_algorithm(
+        "mlp_silu_mul",
+        choices,
+        input_nodes,
+        layout,
+    )
+    if len(x_size) > 2:
+        result = view(result, (*x_size[:-1], result.get_size()[-1]))
+    return result
 
 
 def register_onednn_fusion_ops():
@@ -165,8 +242,8 @@ def register_onednn_fusion_ops():
         @register_lowering(torch.ops.mkldnn._linear_pointwise)
         def linear_unary(
             x: TensorBox,
-            w: TensorBox,
-            b: TensorBox,
+            w: Union[TensorBox, List[TensorBox]],
+            b: Union[TensorBox, List[TensorBox]],
             attr,
             scalars,
             algorithm,
@@ -176,6 +253,7 @@ def register_onednn_fusion_ops():
             if len(x_size) > 2:
                 # GEMM template needs 2D input, normalize input shape here
                 x = view(x, [-1, x_size[-1]])
+
             if b is not None:
                 b = ir.ExternKernel.realize_input(b)
             choices: List[ChoiceCaller] = []
@@ -213,6 +291,7 @@ def register_onednn_fusion_ops():
                         **kwargs,
                     )
                 )
+            assert isinstance(w, TensorBox)
             assert w.get_name() in V.graph.constants
             input_gen_fns = {
                 1: lambda x: V.graph.constants[x.get_name()],
